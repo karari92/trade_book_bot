@@ -55,11 +55,13 @@ class CleanAggressiveMoveDetector:
         self.price_history.append(price)
 
     def update_mtf_history(self, df, label, window_seconds):
+        """Slice the correct time window from full df and record metrics."""
         if df.empty:
             return
-        cutoff = df["time"].max() - window_seconds
+        latest_time = df["time"].max()
+        cutoff = latest_time - window_seconds
         window_df = df[df["time"] >= cutoff]
-        if window_df.empty:
+        if window_df.empty or len(window_df) < 3:
             return
         vol = window_df["qty"].sum()
         buy = window_df[window_df["side"] == "BUY"]["qty"].sum()
@@ -321,17 +323,22 @@ class CleanAggressiveMoveDetector:
         if df.empty or len(df) < self.min_trades:
             return self._empty_result()
 
-        total_volume = df["qty"].sum()
-        buy_volume = df[df["side"] == "BUY"]["qty"].sum()
-        sell_volume = df[df["side"] == "SELL"]["qty"].sum()
+        # Use 10s window for core signal metrics
+        df_10s = df[df["time"] >= (df["time"].max() - 10)] if not df.empty else df
+        if df_10s.empty or len(df_10s) < self.min_trades:
+            return self._empty_result()
+
+        total_volume = df_10s["qty"].sum()
+        buy_volume = df_10s[df_10s["side"] == "BUY"]["qty"].sum()
+        sell_volume = df_10s[df_10s["side"] == "SELL"]["qty"].sum()
         delta = buy_volume - sell_volume
 
         if total_volume < self.min_volume:
             return self._empty_result()
 
-        avg_price = df["price"].mean()
-        last_price = df.iloc[0]["price"]
-        first_price = df.iloc[-1]["price"]
+        avg_price = df_10s["price"].mean()
+        last_price = df_10s.iloc[0]["price"]
+        first_price = df_10s.iloc[-1]["price"]
         price_change_pct = ((last_price - first_price) / first_price) * 100
 
         self.update_history(total_volume, delta, avg_price)
@@ -343,9 +350,11 @@ class CleanAggressiveMoveDetector:
 
         volume_zscore = self.calculate_clean_zscore(total_volume, self.volume_history)
         delta_ratio = abs(delta) / total_volume if total_volume > 0 else 0
-        trades_per_sec = len(df) / window_seconds if window_seconds > 0 else 0
-        whale_clustered, whale_concentration = self.detect_whale_cluster(df)
-        has_acceleration = self.detect_momentum_acceleration(df)
+        # trades_per_sec based on 10s window only
+        df_10s = df[df["time"] >= (df["time"].max() - 10)] if not df.empty else df
+        trades_per_sec = len(df_10s) / 10 if not df_10s.empty else 0
+        whale_clustered, whale_concentration = self.detect_whale_cluster(df_10s)
+        has_acceleration = self.detect_momentum_acceleration(df_10s)
 
         raw_buy = (
             volume_zscore >= self.volume_spike_threshold and

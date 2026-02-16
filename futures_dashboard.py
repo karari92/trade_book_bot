@@ -127,16 +127,21 @@ for key, value in defaults.items():
 # ================= LOAD DATA =================
 now = time.time()
 cutoff = now - WINDOW_SECONDS
+cutoff_60 = now - 60  # full 60s for MTF
 
 if trade_queue:
-    df = pd.DataFrame(list(trade_queue))
-    df = df[df["time"] >= cutoff]
-    df = df.sort_values("time", ascending=False)
-    df["value"] = df["price"] * df["qty"]
+    full_df = pd.DataFrame(list(trade_queue))
+    full_df = full_df.sort_values("time", ascending=False)
+    full_df["value"] = full_df["price"] * full_df["qty"]
+    # 10s slice for display and primary detection
+    df = full_df[full_df["time"] >= cutoff].copy()
+    # 60s slice passed to detector for MTF windows
+    df_mtf = full_df[full_df["time"] >= cutoff_60].copy()
     st.session_state.trade_history.extend(df.to_dict("records"))
     st.session_state.trade_history = st.session_state.trade_history[-2000:]
 else:
     df = pd.DataFrame(columns=["time", "side", "price", "qty", "value"])
+    df_mtf = pd.DataFrame(columns=["time", "side", "price", "qty", "value"])
 
 # ================= LGP CALCULATION =================
 def calculate_lgp(df):
@@ -206,16 +211,21 @@ htf_4h = htf_candles.get("trend_4h", "NEUTRAL")
 oi_chg = open_interest.get("change_pct", 0.0)
 oi_spk = open_interest.get("spike", False)
 ob_imb = order_book.get("imbalance", 0.0)
-aggressive_data = st.session_state.enhanced_detector.detect_clean_aggressive_move(
-    df=df,
-    window_seconds=WINDOW_SECONDS,
-    current_time=time.time(),
-    htf_trend_1h=htf_1h,
-    htf_trend_4h=htf_4h,
-    oi_change_pct=oi_chg,
-    oi_spike=oi_spk,
-    ob_imbalance=ob_imb,
-)
+
+# Safe call - works with both old and new enhanced_detection.py
+import inspect
+_detect_fn = st.session_state.enhanced_detector.detect_clean_aggressive_move
+_detect_params = inspect.signature(_detect_fn).parameters
+_detect_kwargs = dict(df=df_mtf, window_seconds=WINDOW_SECONDS, current_time=time.time())
+if "htf_trend_1h" in _detect_params:
+    _detect_kwargs["htf_trend_1h"] = htf_1h
+    _detect_kwargs["htf_trend_4h"] = htf_4h
+if "oi_change_pct" in _detect_params:
+    _detect_kwargs["oi_change_pct"] = oi_chg
+    _detect_kwargs["oi_spike"] = oi_spk
+if "ob_imbalance" in _detect_params:
+    _detect_kwargs["ob_imbalance"] = ob_imb
+aggressive_data = _detect_fn(**_detect_kwargs)
 
 liq_data = detect_liquidations(df)
 
@@ -295,13 +305,16 @@ def send_telegram_alert(message):
         enabled = st.session_state.get("telegram_enabled", False)
         if not enabled or not token or not chat_id:
             return False
+        if not chat_id.lstrip("-").isdigit():
+            return False
         url = "https://api.telegram.org/bot" + token + "/sendMessage"
-        response = requests.post(
-            url,
-            json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
-            timeout=10
-        )
-        return response.status_code == 200
+        # Try with markdown first
+        resp = requests.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}, timeout=10)
+        if resp.status_code == 200:
+            return True
+        # Fallback - plain text (handles markdown parse errors)
+        resp2 = requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=10)
+        return resp2.status_code == 200
     except Exception as e:
         print("Telegram error: " + str(e))
         return False
@@ -1008,25 +1021,83 @@ with st.sidebar:
         st.session_state.exit_profit_pct = st.slider("Take Profit %", 0.5, 5.0, st.session_state.exit_profit_pct, 0.1)
     st.session_state.telegram_enabled = st.checkbox("Telegram Alerts", value=st.session_state.telegram_enabled)
     if st.session_state.telegram_enabled:
-        st.session_state.telegram_token = st.text_input("Bot Token", type="password", value=st.session_state.get("telegram_token", ""))
-        st.session_state.telegram_chat_id = st.text_input("Chat ID", value=st.session_state.get("telegram_chat_id", ""))
-        if st.session_state.telegram_token and st.session_state.telegram_chat_id:
-            st.success("Telegram configured")
-            if st.button("TEST TELEGRAM", use_container_width=True):
-                test_msg = "TEST ALERT\nDashboard is working!\nTime: " + datetime.now().strftime("%H:%M:%S") + "\nPrice: $" + "{:,.2f}".format(current_price)
+        st.session_state.telegram_token = st.text_input("Bot Token", type="password", value=st.session_state.get("telegram_token", ""), help="Get from @BotFather on Telegram")
+        st.session_state.telegram_chat_id = st.text_input("Chat ID", value=st.session_state.get("telegram_chat_id", ""), help="Must be a number. Click AUTO-FETCH to get it.")
+
+        token = st.session_state.get("telegram_token", "").strip()
+        chat_id = st.session_state.get("telegram_chat_id", "").strip()
+
+        # AUTO-FETCH CHAT ID BUTTON
+        if token:
+            if st.button("AUTO-FETCH CHAT ID", use_container_width=True, help="Send any message to your bot first, then click this"):
                 try:
-                    token = st.session_state.telegram_token.strip()
-                    chat_id = st.session_state.telegram_chat_id.strip()
-                    url = "https://api.telegram.org/bot" + token + "/sendMessage"
-                    resp = requests.post(url, json={"chat_id": chat_id, "text": test_msg}, timeout=10)
+                    url = "https://api.telegram.org/bot" + token + "/getUpdates"
+                    resp = requests.get(url, timeout=10)
                     if resp.status_code == 200:
-                        st.success("Telegram sent!")
+                        data = resp.json()
+                        updates = data.get("result", [])
+                        if updates:
+                            # Get the most recent chat ID
+                            found_id = None
+                            for update in reversed(updates):
+                                msg = update.get("message") or update.get("channel_post") or {}
+                                chat = msg.get("chat", {})
+                                if chat.get("id"):
+                                    found_id = str(chat["id"])
+                                    chat_name = chat.get("first_name") or chat.get("title") or "Unknown"
+                                    break
+                            if found_id:
+                                st.session_state.telegram_chat_id = found_id
+                                st.success("Chat ID found: " + found_id + " (" + chat_name + ")")
+                                st.rerun()
+                            else:
+                                st.warning("No messages found. Send a message to your bot first, then click again.")
+                        else:
+                            st.warning("No updates found. Open your bot in Telegram and send /start or any message, then click again.")
+                    elif resp.status_code == 401:
+                        st.error("Invalid Bot Token. Check token from @BotFather.")
                     else:
                         st.error("Failed: " + str(resp.status_code) + " - " + resp.text)
                 except Exception as e:
                     st.error("Error: " + str(e))
+
+        # STATUS + TEST
+        if token and chat_id:
+            # Validate chat_id is numeric
+            if not chat_id.lstrip("-").isdigit():
+                st.error("Chat ID must be a number (e.g. 1234567890). Got: " + chat_id)
+            else:
+                st.success("Telegram configured")
+                if st.button("TEST TELEGRAM", use_container_width=True):
+                    test_msg = "TRADING BOT - TEST ALERT\nDashboard is working!\nTime: " + datetime.now().strftime("%H:%M:%S") + "\nPrice: $" + "{:,.2f}".format(current_price) + "\nStatus: All systems operational"
+                    try:
+                        url = "https://api.telegram.org/bot" + token + "/sendMessage"
+                        resp = requests.post(url, json={"chat_id": chat_id, "text": test_msg, "parse_mode": "Markdown"}, timeout=10)
+                        if resp.status_code == 200:
+                            st.success("Sent! Check your Telegram now.")
+                        elif resp.status_code == 400:
+                            err = resp.json().get("description", "")
+                            if "chat not found" in err:
+                                st.error("Chat not found. Open your bot in Telegram and send /start first.")
+                            elif "parse" in err.lower():
+                                # Retry without markdown
+                                resp2 = requests.post(url, json={"chat_id": chat_id, "text": test_msg.replace("*","")}, timeout=10)
+                                if resp2.status_code == 200:
+                                    st.success("Sent! (plain text mode)")
+                                else:
+                                    st.error("Failed: " + str(resp2.status_code))
+                            else:
+                                st.error("Failed: " + err)
+                        elif resp.status_code == 401:
+                            st.error("Invalid token. Get a new one from @BotFather.")
+                        else:
+                            st.error("Failed: " + str(resp.status_code) + " - " + resp.text)
+                    except Exception as e:
+                        st.error("Error: " + str(e))
+        elif token and not chat_id:
+            st.info("Click AUTO-FETCH CHAT ID after sending a message to your bot")
         else:
-            st.warning("Enter token and Chat ID")
+            st.warning("Enter your Bot Token first")
     st.markdown("---")
     st.subheader("Test Alerts")
     tcol1, tcol2 = st.columns(2)
