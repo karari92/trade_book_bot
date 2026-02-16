@@ -107,6 +107,11 @@ defaults = {
     "buy_signal_duration": 0.0,
     "sell_signal_duration": 0.0,
     "confidence_history_short": [],
+    "auto_refresh": True,
+    "refresh_interval": 1,
+    "refresh_count": 0,
+    "last_signal_time_display": "Never",
+    "uptime_start": time.time(),
     "in_position": False,
     "position_type": None,
     "entry_price": 0.0,
@@ -1016,6 +1021,25 @@ with st.sidebar:
     st.session_state.exit_alerts_enabled = st.checkbox("Exit Alerts", value=st.session_state.exit_alerts_enabled)
     st.session_state.alert_repeat_interval = st.slider("Repeat Interval (sec)", 10, 120, st.session_state.get("alert_repeat_interval", 30), 5)
     st.caption("Alerts repeat every " + str(st.session_state.get("alert_repeat_interval", 30)) + "s while signal is active")
+    st.markdown("---")
+    st.subheader("Auto Refresh")
+    st.session_state.auto_refresh = st.toggle("Auto Refresh", value=st.session_state.get("auto_refresh", True))
+    if st.session_state.auto_refresh:
+        st.session_state.refresh_interval = st.select_slider(
+            "Refresh Speed",
+            options=[1, 2, 3, 5],
+            value=st.session_state.get("refresh_interval", 1),
+            format_func=lambda x: str(x) + "s"
+        )
+        st.caption("Refreshing every " + str(st.session_state.refresh_interval) + "s")
+        if st.button("PAUSE", use_container_width=True):
+            st.session_state.auto_refresh = False
+            st.rerun()
+    else:
+        st.warning("Auto refresh PAUSED")
+        if st.button("RESUME", use_container_width=True):
+            st.session_state.auto_refresh = True
+            st.rerun()
     if st.session_state.exit_alerts_enabled:
         st.session_state.exit_loss_pct = st.slider("Stop Loss %", 0.1, 2.0, st.session_state.exit_loss_pct, 0.1)
         st.session_state.exit_profit_pct = st.slider("Take Profit %", 0.5, 5.0, st.session_state.exit_profit_pct, 0.1)
@@ -1135,5 +1159,29 @@ st.markdown("---")
 status = "LIQUIDITY GRAB" if lgp >= 70 else "CLEAN SIGNAL" if aggression_score >= 80 else "WATCHING" if lgp >= 40 else "NORMAL"
 st.caption("v5.0 FULLY OPTIMIZED | " + status + " | " + datetime.now().strftime("%H:%M:%S") + " | LGP: " + str(lgp) + "% | Confidence: " + str(aggression_score) + "%")
 
-time.sleep(1)
-st.rerun()
+# ================= AUTO REFRESH ENGINE =================
+st.session_state.refresh_count = st.session_state.get("refresh_count", 0) + 1
+uptime_secs = int(time.time() - st.session_state.get("uptime_start", time.time()))
+uptime_hrs = uptime_secs // 3600
+uptime_mins = (uptime_secs % 3600) // 60
+uptime_str = str(uptime_hrs) + "h " + str(uptime_mins) + "m"
+
+# Status bar at very bottom
+st.markdown("---")
+status_cols = st.columns(4)
+with status_cols[0]:
+    auto_on = st.session_state.get("auto_refresh", True)
+    st.markdown("*Auto Refresh:* " + ("RUNNING" if auto_on else "PAUSED"))
+with status_cols[1]:
+    st.markdown("*Uptime:* " + uptime_str)
+with status_cols[2]:
+    st.markdown("*Refresh #:* " + str(st.session_state.refresh_count))
+with status_cols[3]:
+    warmup = len(st.session_state.enhanced_detector.volume_history)
+    st.markdown("*Warmup:* " + str(warmup) + "/30 " + ("READY" if warmup >= 30 else "warming"))
+
+# Auto refresh control in sidebar (add near top)
+if st.session_state.get("auto_refresh", True):
+    interval = st.session_state.get("refresh_interval", 1)
+    time.sleep(interval)
+    st.rerun()
